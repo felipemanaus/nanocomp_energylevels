@@ -3,6 +3,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import scipy.special as sp
+import scipy.linalg as la  # Adicionado para resolver a matriz do poço finito
 
 # --- Configuração da Página ---
 st.set_page_config(
@@ -36,12 +37,7 @@ particles = {
 
 
 def hex_to_rgba(hex_color: str, alpha: float = 0.15) -> str:
-    """Converte uma cor hexadecimal (#rrggbb) para string rgba() com transparência.
-
-    A versão anterior tentava fazer isso com color.replace('rgb', 'rgba')...,
-    o que não tem efeito nenhum sobre uma string hexadecimal (o preenchimento
-    ficava sólido, sem transparência).
-    """
+    """Converte uma cor hexadecimal (#rrggbb) para string rgba() com transparência."""
     hex_color = hex_color.lstrip('#')
     r = int(hex_color[0:2], 16)
     g = int(hex_color[2:4], 16)
@@ -50,17 +46,9 @@ def hex_to_rgba(hex_color: str, alpha: float = 0.15) -> str:
 
 
 def compute_spherical_harmonic(l: int, m: int, theta: np.ndarray, phi: np.ndarray) -> np.ndarray:
-    """Calcula Y_l^m(theta, phi) de forma compatível com scipy novo e antigo.
-
-    A partir do SciPy 1.15, `scipy.special.sph_harm` foi removida em favor de
-    `sph_harm_y`, que também mudou a ordem dos argumentos (n=l primeiro, depois
-    m) — usando sempre theta=ângulo polar [0, pi] e phi=ângulo azimutal
-    [0, 2pi]. Sem esse ajuste o app quebra com AttributeError em qualquer
-    SciPy recente.
-    """
+    """Calcula Y_l^m(theta, phi) de forma compatível com scipy novo e antigo."""
     if hasattr(sp, "sph_harm_y"):
         return sp.sph_harm_y(l, m, theta, phi)
-    # Fallback para SciPy < 1.15 (assinatura antiga: sph_harm(m, n, phi, theta))
     return sp.sph_harm(m, l, phi, theta)
 
 
@@ -72,7 +60,12 @@ st.sidebar.image(
     width=100
 )
 st.sidebar.markdown("## Navegação")
-menu = st.sidebar.radio("Escolha a simulação:", ["Poço de Potencial Infinito", "Orbitais Atômicos 3D"])
+# Adicionando a nova aba de Poço Finito
+menu = st.sidebar.radio("Escolha a simulação:", [
+    "Poço de Potencial Infinito", 
+    "Poço de Potencial Finito", 
+    "Orbitais Atômicos 3D"
+])
 st.sidebar.markdown("---")
 
 # ==========================================
@@ -94,7 +87,7 @@ if menu == "Poço de Potencial Infinito":
     E1_eV = E1_J / eV_to_J
 
     st.title("Poço de Potencial Infinito")
-    st.markdown("Analise o comportamento ondulatório da matéria sob confinamento 1D.")
+    st.markdown("Analise o comportamento ondulatório da matéria sob confinamento absoluto (1D).")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Massa da Partícula", f"{mass_kg:.2e} kg")
@@ -108,8 +101,7 @@ if menu == "Poço de Potencial Infinito":
         subplot_titles=("Níveis de Energia", "Função de Onda ψ<sub>n</sub>(x)", "Probabilidade |ψ<sub>n</sub>(x)|²"),
         horizontal_spacing=0.05
     )
-    # Paleta com 10 cores distintas (antes só havia 8, e n_max pode chegar a 10,
-    # o que fazia dois níveis repetirem a mesma cor)
+    
     colors = [
         '#00e5ff', '#ff00ea', '#76ff03', '#ffea00', '#ff3d00',
         '#bd00ff', '#1de9b6', '#ff4081', '#40c4ff', '#eeff41'
@@ -149,7 +141,7 @@ if menu == "Poço de Potencial Infinito":
         ), row=1, col=3)
         fig.add_trace(go.Scatter(
             x=x, y=prob_scaled, mode='lines', fill='tonexty',
-            fillcolor=hex_to_rgba(color, 0.15),  # antes o fill ficava sólido (bug de transparência)
+            fillcolor=hex_to_rgba(color, 0.15),
             line=dict(color=color, width=2, shape='spline'), showlegend=False
         ), row=1, col=3)
 
@@ -165,8 +157,134 @@ if menu == "Poço de Potencial Infinito":
     fig.update_layout(height=600, template="plotly_dark", hovermode="x unified", margin=dict(l=40, r=20, t=60, b=40))
     st.plotly_chart(fig, width='stretch')
 
+
 # ==========================================
-# SIMULAÇÃO 2: ORBITAIS 3D E ÁTOMOS
+# SIMULAÇÃO 2: POÇO DE POTENCIAL FINITO
+# ==========================================
+elif menu == "Poço de Potencial Finito":
+    with st.sidebar:
+        st.markdown("## Parâmetros do Poço Finito")
+        selected_particle = st.selectbox("Elemento/Partícula:", list(particles.keys()))
+        mass_kg = particles[selected_particle]
+
+        L_nm = st.slider("Largura do Poço (nm):", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
+        L_m = L_nm * 1e-9
+
+        V0_eV = st.slider("Profundidade do Poço (V₀ em eV):", min_value=1.0, max_value=50.0, value=10.0, step=0.5)
+        V0_J = V0_eV * eV_to_J
+
+    st.title("Poço de Potencial Finito")
+    st.markdown("Ao contrário do poço infinito, as paredes têm uma altura real de energia ($V_0$). Isso permite que o elétron 'vaze' sutilmente para as paredes (tunelamento) e cria um número estritamente **limitado** de estados ligados.")
+
+    # 1. Configuração do Método de Diferenças Finitas (FDM)
+    N = 1000 # Número de pontos da malha
+    # Estendemos a malha para os lados para podermos visualizar o tunelamento/decaimento
+    x_nm = np.linspace(-L_nm, 2 * L_nm, N) 
+    x_m = x_nm * 1e-9
+    dx_m = x_m[1] - x_m[0]
+
+    # Construção do Potencial V(x)
+    V_array_J = np.where((x_nm >= 0) & (x_nm <= L_nm), 0.0, V0_J)
+
+    # Construção da Matriz Hamiltoniana Tridiagonal
+    t0 = (hbar ** 2) / (2 * mass_kg * dx_m ** 2)
+    diagonal = 2 * t0 + V_array_J
+    off_diagonal = -t0 * np.ones(N - 1)
+
+    # Resolução dos Autovalores (Energia) e Autovetores (Funções de Onda)
+    E_J, vecs = la.eigh_tridiagonal(diagonal, off_diagonal)
+    E_eV = E_J / eV_to_J
+
+    # Filtramos apenas os estados que estão "presos" dentro do poço (E < V0)
+    bound_states = [i for i in range(len(E_eV)) if E_eV[i] < V0_eV]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Massa da Partícula", f"{mass_kg:.2e} kg")
+    col2.metric("Largura do Poço (L)", f"{L_nm:.1f} nm")
+    col3.metric("Total de Estados Ligados", len(bound_states))
+
+    st.markdown("---")
+
+    fig = make_subplots(
+        rows=1, cols=3,
+        subplot_titles=("Níveis de Energia", "Função de Onda ψ<sub>n</sub>(x)", "Probabilidade |ψ<sub>n</sub>(x)|²"),
+        horizontal_spacing=0.05
+    )
+
+    colors = [
+        '#00e5ff', '#ff00ea', '#76ff03', '#ffea00', '#ff3d00',
+        '#bd00ff', '#1de9b6', '#ff4081', '#40c4ff', '#eeff41'
+    ]
+
+    # Desenhando o fundo do potencial V(x) nos 3 gráficos para contexto visual
+    V_plot_eV = np.where((x_nm >= 0) & (x_nm <= L_nm), 0.0, V0_eV)
+    
+    for i in range(1, 4):
+        # Linha branca do formato do poço
+        fig.add_trace(go.Scatter(x=x_nm, y=V_plot_eV, mode='lines', line=dict(color='white', width=2), showlegend=False), row=1, col=i)
+        # Preenchimento cinza das paredes
+        fig.add_vrect(x0=x_nm[0], x1=0, fillcolor="rgba(100, 100, 100, 0.2)", line_width=0, row=1, col=i)
+        fig.add_vrect(x0=L_nm, x1=x_nm[-1], fillcolor="rgba(100, 100, 100, 0.2)", line_width=0, row=1, col=i)
+
+    # Plotando os estados ligados (limitando a max 10 para o gráfico não ficar poluído se V0 for gigante)
+    max_plot_states = min(len(bound_states), 10)
+    for i in range(max_plot_states):
+        n = i + 1
+        idx = bound_states[i]
+        En = E_eV[idx]
+
+        # Extração da função de onda (normalizando com dx)
+        psi = vecs[:, idx] / np.sqrt(dx_m)
+        prob_density = psi ** 2
+
+        # Escalonamento visual para que as ondas caibam graciosamente dentro das paredes (V0)
+        scale_psi = (V0_eV * 0.1) / np.max(np.abs(psi)) if np.max(np.abs(psi)) > 0 else 1
+        scale_prob = (V0_eV * 0.2) / np.max(prob_density) if np.max(prob_density) > 0 else 1
+
+        psi_scaled = (psi * scale_psi) + En
+        prob_scaled = (prob_density * scale_prob) + En
+
+        color = colors[i % len(colors)]
+
+        # 1. Níveis de Energia
+        fig.add_trace(go.Scatter(
+            x=[0, L_nm], y=[En, En], mode='lines+markers',
+            line=dict(color=color, width=3), marker=dict(size=6, symbol='line-ew-open'),
+            name=f"n={n} ({En:.2f} eV)"
+        ), row=1, col=1)
+
+        # 2. Função de Onda (Observe o decaimento nas bordas!)
+        fig.add_trace(go.Scatter(
+            x=[x_nm[0], x_nm[-1]], y=[En, En], mode='lines',
+            line=dict(color='rgba(255,255,255,0.2)', dash='dash'), showlegend=False
+        ), row=1, col=2)
+        fig.add_trace(go.Scatter(
+            x=x_nm, y=psi_scaled, mode='lines',
+            line=dict(color=color, width=2, shape='spline'), showlegend=False
+        ), row=1, col=2)
+
+        # 3. Densidade de Probabilidade
+        fig.add_trace(go.Scatter(
+            x=[x_nm[0], x_nm[-1]], y=[En, En], mode='lines',
+            line=dict(color='rgba(255,255,255,0.2)', dash='dash'), showlegend=False
+        ), row=1, col=3)
+        fig.add_trace(go.Scatter(
+            x=x_nm, y=prob_scaled, mode='lines', fill='tonexty',
+            fillcolor=hex_to_rgba(color, 0.15),
+            line=dict(color=color, width=2, shape='spline'), showlegend=False
+        ), row=1, col=3)
+
+    for i in range(1, 4):
+        fig.update_xaxes(title_text="Posição x (nm)", range=[x_nm[0], x_nm[-1]], showgrid=False, zeroline=False, row=1, col=i)
+        fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.1)', zeroline=False, row=1, col=i)
+
+    fig.update_yaxes(title_text="Energia (eV)", range=[0, V0_eV * 1.1], row=1, col=1)
+    fig.update_layout(height=600, template="plotly_dark", hovermode="x unified", margin=dict(l=40, r=20, t=60, b=40))
+    st.plotly_chart(fig, width='stretch')
+
+
+# ==========================================
+# SIMULAÇÃO 3: ORBITAIS 3D E ÁTOMOS
 # ==========================================
 elif menu == "Orbitais Atômicos 3D":
     st.title("Orbitais e Átomos Multieletrônicos")
@@ -194,11 +312,6 @@ elif menu == "Orbitais Atômicos 3D":
         l_val = st.slider("Número Quântico Azimutal (l):", min_value=0, max_value=3, value=1)
         st.markdown(f"**Tipo de Orbital:** {l_dict[l_val]}")
 
-        # BUG CORRIGIDO: quando l = 0, m_l só pode ser 0. O slider antigo era
-        # criado com min_value=-l_val e max_value=l_val, ou seja, 0 e 0 — e o
-        # Streamlit lança StreamlitAPIException quando min_value == max_value,
-        # o que impedia (com erro) selecionar l = 0. Agora tratamos esse caso
-        # sem usar um slider degenerado.
         if l_val == 0:
             ml_val = 0
             st.markdown("**Número Quântico Magnético (m_l):** 0 (único valor possível para l = 0)")
@@ -222,36 +335,23 @@ elif menu == "Orbitais Atômicos 3D":
         """)
 
     with col2:
-        # Criação da malha esférica
-        theta = np.linspace(0, np.pi, 100)      # Ângulo polar
-        phi = np.linspace(0, 2 * np.pi, 100)    # Ângulo azimutal
+        theta = np.linspace(0, np.pi, 100)
+        phi = np.linspace(0, 2 * np.pi, 100)
         theta, phi = np.meshgrid(theta, phi)
 
-        # Cálculo dos Harmônicos Esféricos
-        # BUG CORRIGIDO: scipy.special.sph_harm foi removida em versões
-        # recentes do SciPy (>= 1.15), o que fazia essa página inteira quebrar
-        # com AttributeError independentemente dos valores de l e m_l
-        # escolhidos. compute_spherical_harmonic() usa a nova sph_harm_y
-        # quando disponível, com fallback para a API antiga.
         Y = compute_spherical_harmonic(l_val, ml_val, theta, phi)
-
-        # Densidade de Probabilidade Angular
         R = np.abs(Y) ** 2
 
         if l_val == 0:
-            R = R * 5  # Ajuste visual para o orbital 's'
+            R = R * 5
 
-        # APROXIMAÇÃO FÍSICA: Contração do orbital proporcional a 1/√Z
-        # Orbitais de átomos mais pesados ficam mais próximos do núcleo
         contraction_factor = 1 / np.sqrt(Z_atom)
         R = R * contraction_factor
 
-        # Conversão para coordenadas cartesianas
         X = R * np.sin(theta) * np.cos(phi)
         Y_coord = R * np.sin(theta) * np.sin(phi)
         Z_coord = R * np.cos(theta)
 
-        # Plotly Surface 3D
         fig3d = go.Figure(data=[go.Surface(
             x=X, y=Y_coord, z=Z_coord,
             surfacecolor=R,
@@ -263,7 +363,6 @@ elif menu == "Orbitais Atômicos 3D":
             lighting=dict(ambient=0.5, diffuse=0.8, specular=0.5, roughness=0.5)
         )])
 
-        # O range é fixo para que o usuário possa ver a contração visualmente ao trocar de átomo
         fixed_range = 0.5
 
         fig3d.update_layout(
