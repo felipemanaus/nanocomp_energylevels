@@ -65,3 +65,10 @@ Explore a densidade de probabilidade tridimensional dos elétrons no átomo de H
    ```
 
 4. Utilize o menu lateral para selecionar entre as três simulações disponíveis e altere os parâmetros para explorar os diferentes fenômenos quânticos.
+
+
+## Vídeo
+
+O link abaixo contém um pequeno vídeo o qual explica a ideia geral da aplicação.
+
+https://youtu.be/RpsaLS-utKU
